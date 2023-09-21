@@ -1,0 +1,14 @@
+# metadata of the stream
+Metadata:
+  - name: time
+    dtype: float
+    shape: [1]
+  - name: velocity
+# and one here
+    dtype: float
+# and one here
+    shape: [3]
+  - name: probes
+    dtype: int
+    shape: [-1,]
+# medatada end

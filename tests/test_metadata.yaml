@@ -1,0 +1,10 @@
+Metadata:
+  - name: time
+    dtype: float
+    shape: [1]
+  - name: velocity
+    dtype: float
+    shape: [3]
+  - name: probes
+    dtype: int
+    shape: [-1,]

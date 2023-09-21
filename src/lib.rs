@@ -1,13 +1,15 @@
 #![feature(iterator_try_collect)]
+use std::io::BufRead;
 use serde::{Serialize, Deserialize};
 use std::fmt::Display;
 use std::fs::File;
-use std::io::{BufReader, BufRead};
 use std::str::FromStr;
 use std::io;
 use std::path::Path;
 use std::string::String;
+use std::num::ParseFloatError;
 use serde::ser::StdError;
+use ndarray::prelude::*;
 
 #[derive(Debug, PartialEq)]
 enum StreamElementType {
@@ -20,6 +22,8 @@ enum ParseStreamError {
     DtypeParseError,
     NoStreamDimension,
     InvalidStreamDimension,
+    WrongElementCount,
+    ElementParseError,
 }
 
 impl Display for ParseStreamError {
@@ -28,6 +32,8 @@ impl Display for ParseStreamError {
             Self::DtypeParseError => write!(f, "Failed to read data type. Data type has to be 'int' or 'float"),
             Self::NoStreamDimension => write!(f, "No dimension of the data specified"),
             Self::InvalidStreamDimension => write!(f, "Having a dynamic inner dimension is not allowed"),
+            Self::WrongElementCount => write!(f, "The stream content did not have the same amount of elements as where specified by the shape of the array"),
+            Self::ElementParseError => write!(f, "It was not possible to parse an element in the stream data into a number"),
         }
     }
 }
@@ -51,6 +57,12 @@ impl FromStr for StreamElementType {
         } else {
             return Err(ParseStreamError::DtypeParseError);
         }
+    }
+}
+
+impl From<ParseFloatError> for ParseStreamError {
+    fn from(value: ParseFloatError) -> Self {
+        ParseStreamError::ElementParseError
     }
 }
 
@@ -123,61 +135,116 @@ struct RawStreamsMD {
     Metadata: Vec<RawStreamMetaData>,
 }
 
-struct StreamReader
+pub struct StreamReader
 {
-    input: Box<dyn Iterator<Item= String>>,
+    input: Box<dyn Iterator<Item= io::Result<String>>>,
     high_water_mark: u32,
     metadata: Vec<Stream>,
+    buffers: Vec<Box<[ArrayD<f32>]>>,
 }
 
 impl StreamReader {
-    fn new(fname: &Path, high_water_mark: u32) -> Result<StreamReader, io::Error> {
-        let file = File::open(fname)?;
-        let freader = BufReader::new(file);
-        let mut filtered_lines = read_lines_without_comments(freader)?;
-        let metadata_str = read_until_data_section(&mut filtered_lines, 100)?;
+    pub fn new(fname: &Path, high_water_mark: u32) -> Result<StreamReader, io::Error> {
+        let lines = build_line_iterator(fname)?;
+        let mut filtered_lines = filter_out_comment_lines('#', lines);
+        let metadata_str = read_until_line_starts_with("Data:", 92, &mut filtered_lines)?;
         let raw_metadata: RawStreamsMD = match serde_yaml::from_str(&metadata_str){
             Ok(val) => val,
             Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
         };
-        // TODO! We still need a way to return th
         let metadata: Vec<Stream> = raw_metadata.Metadata.iter().map(Stream::try_from).try_collect()?;
+        let stream_buffers: Vec<Box<[ArrayD<f32>]> = metadata.iter().map(|m| Box::new([ArrayD; m.shape.iter().product()])); 
         Ok(StreamReader {
             input: Box::new(filtered_lines),
             high_water_mark,
             metadata,
+            buffers: Box::new([Box::new([Box::new([metadata.shape.iter().product()]); high_water_mark]); metadata.len()])
         })
     }
 }
 
-// The output is wrapped in a Result to allow matching on errors
-// Returns an Iterator to the Reader of the lines of the file.
-pub fn read_lines_without_comments(file: BufReader<File>) -> Result<impl Iterator<Item = String>, io::Error> {
-    Ok(file.lines().map(|line| line.unwrap_or("".to_string())).filter(|line| !line.starts_with("#")))
+
+/// Given a path to a file, generate an iterator that returns the lines of a file.
+pub fn build_line_iterator<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
+where 
+    P: AsRef<Path>
+{
+    let file = File::open(filename)?;
+    Ok(io::BufReader::new(file).lines())
 }
 
-// read the metadata  section and return it as a string ready to be parsed into the Stream Meta
-// Data structure
-pub fn read_until_data_section(input: &mut impl Iterator<Item = String>, metadata_size: u32) -> Result<std::string::String, std::io::Error> {
-    let mut metadata_string = String::new();
-    let mut line_count = 0;
-    for line in input {
-        if line.starts_with("Data:") {
-            metadata_string.push_str(&line);
-            metadata_string.push('\n');
-            return Ok(metadata_string);
+/// filter out lines that start with the `comment_char`
+pub fn filter_out_comment_lines(comment_char: char, lines: impl Iterator<Item = io::Result<String>>) -> impl Iterator<Item = io::Result<String>> {
+    lines.filter(
+        move |l| l.as_ref().is_ok_and(|line| !line.starts_with(comment_char)) || l.is_err()
+    )
+}
+
+/// Accumulate the lines of a file until the start of a line matches `matchstr`.
+/// This method borrows the line iterator, so that when the function terminates the iterator is
+/// left at the first line after the line that matched.
+pub fn read_until_line_starts_with<'a>(matchstr: &'a str, max_lines: i32, lines: &'a mut impl Iterator<Item = io::Result<String>>) -> io::Result<String> {
+    let mut res = String::new();
+    let mut counter = 1;
+    while let Some(line) = lines.next() {
+        if counter > max_lines {
+            break;
         }
-        line_count += 1;
-        if line_count > metadata_size {
-            return Err(std::io::Error::new(io::ErrorKind::Other, "Metadata line count exceeded")); 
+        match line {
+            Ok(l) => if l.starts_with(matchstr) { 
+                break 
+            } else { 
+                res.push_str(&l);
+                res.push('\n');
+            },
+            Err(e) => return Err(e),
         }
     }
-    Err(std::io::Error::new(io::ErrorKind::Other, "No Data section found in the file")) 
+    Ok(res)
+}
+
+/// Given a String that represents a line of the data input 
+pub fn split_line_into_streams<'a>(stream_delimiter: char, line: &'a String) -> Vec<Vec<&'a str>> {
+    line.split(stream_delimiter).map(|s| s.split(&[',', ' ']).filter(|ss| ss.len() != 0).collect()).collect()
+}
+
+/// given the elements that where found in the stream, assemble them into an ndArray
+pub fn build_array<'a>(shape: &Vec<usize>, data: &'a Vec<&'a str>) -> Result<ArrayD<f32>, ParseStreamError> {
+    let parsed_data: Vec<f32> = data.iter().map(|s| s.parse::<f32>()).try_collect()?;
+    if parsed_data.len() != shape.iter().map(|s| *s as usize).product() {
+        return Err(ParseStreamError::WrongElementCount)
+    }
+    Ok(ArrayD::<f32>::from_shape_vec(IxDyn(&shape[..]), parsed_data).unwrap())
+}
+
+/// Read the first n lines of a file that is wrapped in a BufReader
+/// This function alters the iterator that represents the current location in the file, leaving it
+/// at line n+1. The first n lines are concatinated into a string that is returned at the end of
+/// the function
+fn read_n_lines<'a>(n: u32, lines: &'a mut impl Iterator<Item = io::Result<String>>) -> io::Result<String> {
+    let mut res = String::new();
+    for _i in 0..n {
+        let line = lines.next();
+        match line {
+            Some(Ok(l)) => {
+                res.push_str(&l);
+                res.push('\n');
+            }
+            Some(Err(e)) => return Err(e),
+            None => break,
+        }
+    }
+    Ok(res)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::*;
+    use std::io::BufReader;
+    use std::io::Cursor;
+    use std::fs::File;
+    use std::io::BufRead;
+    use std::iter::zip;
     use std::fs::read_to_string;
     #[test]
     fn test_meta_with_name() {
@@ -246,6 +313,63 @@ shape: [3, 3]
     }
 
     #[test]
-    fn test_raw_stream_metadata() {
+    fn test_read_until_data_section() {
+        let mut test_input_line_iter = BufReader::new(File::open("../tests/test_read_until_data_section")).lines();
+        let metadata_str = read_until_data_section(&mut test_input_line_iter, 100).unwrap();
+        assert_eq!(test_input_line_iter.next().unwrap(), "-1");
+    }
+    #[test]
+    fn test_read_n_lines() {
+        let mut file = BufReader::new(File::open("tests/read_n_lines_test").unwrap()).lines(); 
+        let first_three_lines = read_n_lines(3, &mut file).unwrap();
+        assert_eq!(first_three_lines, "1\n2\n3\n");
+        let Some(Ok(fourth_line)) = file.next() else {panic!("reading fourth line failed")};
+        assert_eq!(fourth_line, "4");
+    }
+
+    #[test]
+    fn test_read_n_lines_from_string() {
+        let mut string_iter = Cursor::new("1\n2\n3\n4\n".to_string()).lines();
+        let first_three_lines = read_n_lines(3, &mut string_iter).unwrap();
+        assert_eq!(first_three_lines, "1\n2\n3\n");
+        let Some(Ok(fourth_line)) = string_iter.next() else {panic!("reading fourth line failed")};
+        assert_eq!(fourth_line, "4");
+    }
+
+    #[test]
+    fn test_read_too_many_lines() {
+        let mut string_iter = Cursor::new("1\n2\n3\n4\n").lines();
+        let first_six_lines = read_n_lines(6, &mut string_iter).unwrap();
+        assert_eq!(first_six_lines, "1\n2\n3\n4\n");
+    }
+
+    #[test]
+    fn test_filter_out_lines_from_input() {
+        let string_iter = Cursor::new("1\n#2\n3\n4\n#5\n6\n").lines();
+        let mut filtered_iter = filter_out_comment_lines('#', string_iter);
+        let first_three_lines_uncommented = read_n_lines(3, &mut filtered_iter).unwrap();
+        assert_eq!(first_three_lines_uncommented, "1\n3\n4\n");
+    }
+    
+    #[test]
+    fn test_read_until_data_start() {
+        let mut file = BufReader::new(File::open("tests/read_metadata_section").unwrap()).lines();
+        let metadata_section = read_until_line_starts_with("Data:", &mut file).unwrap();
+        assert_eq!(metadata_section, "Metadata:\n  - name: Stream1\n    dtype: int\n    shape: [1]\n");
+        let next_line = file.next().unwrap().unwrap();
+        assert_eq!(next_line, "1");
+    }
+
+    #[test]
+    fn test_stream_spltting() {
+        let line = "1, 2 3, 5.15, | 6 7, 8".to_string();
+        let reference = vec![vec!["1", "2", "3", "5.15"], vec!["6", "7", "8"]];
+        let numbers: Vec<Vec<&str>> = split_line_into_streams('|', &line);
+        for content in zip(numbers, reference) {
+            let values = zip(content.0, content.1);
+            for (v, r) in values {
+                assert_eq!(v, r);
+            }
+        }
     }
 }
