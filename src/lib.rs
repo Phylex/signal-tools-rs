@@ -17,8 +17,17 @@ enum StreamElementType {
     Float,
 }
 
+impl Display for StreamElementType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Int => write!(f, "int"),
+            Self::Float => write!(f, "float"),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
-enum ParseStreamError {
+pub enum ParseStreamError {
     DtypeParseError,
     NoStreamDimension,
     InvalidStreamDimension,
@@ -61,15 +70,18 @@ impl FromStr for StreamElementType {
 }
 
 impl From<ParseFloatError> for ParseStreamError {
-    fn from(value: ParseFloatError) -> Self {
+    fn from(_value: ParseFloatError) -> Self {
         ParseStreamError::ElementParseError
     }
 }
 
 #[derive(Debug, PartialEq)]
 enum StreamDimensions {
-    Static(Vec<u16>),
-    Dynamic(Vec<u16>),
+    Static(Vec<usize>),
+    Dynamic {
+        element_size: Vec<usize>,
+        entries_per_row: Vec<usize>
+    },
 }
 
 impl TryFrom<Vec<i16>> for StreamDimensions {
@@ -79,18 +91,27 @@ impl TryFrom<Vec<i16>> for StreamDimensions {
         if value.len() < 1 {
             return Err(ParseStreamError::NoStreamDimension);
         }
-        let mut converted_vec: Vec<u16> = Vec::with_capacity(value.len());
+        let mut converted_vec: Vec<usize> = Vec::with_capacity(value.len());
         for &elem in value[..value.len() - 1].into_iter() {
             if elem < 0 {
                 return Err(ParseStreamError::InvalidStreamDimension);
             }
-            converted_vec.push(elem as u16);
+            converted_vec.push(elem as usize);
         }
         if value[value.len() - 1] > -1 {
-            converted_vec.push(value[value.len() - 1] as u16);
+            converted_vec.push(value[value.len() - 1] as usize);
             return Ok(Self::Static(converted_vec));
         } else {
-            return Ok(Self::Dynamic(converted_vec));
+            return Ok(Self::Dynamic {element_size: converted_vec, entries_per_row: vec![] } );
+        }
+    }
+}
+
+impl Display for StreamDimensions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dynamic { element_size, entries_per_row: _} => write!(f, "dynamic dimension with element size {:?}", element_size),
+            Self::Static(element_size) => write!(f, "static dimension of shape {:?}", element_size),
         }
     }
 }
@@ -108,7 +129,7 @@ impl TryFrom<&RawStreamMetaData> for Stream {
         let name = &value.name;
         let shape = match &value.shape {
             Some(dim) => StreamDimensions::try_from(dim.clone())?,
-            None => StreamDimensions::Dynamic(vec![1]),
+            None => StreamDimensions::Dynamic { element_size: vec![1], entries_per_row: vec![] },
         };
         let dtype = value.dtype.parse::<StreamElementType>()?;
         Ok(Stream {
@@ -119,7 +140,10 @@ impl TryFrom<&RawStreamMetaData> for Stream {
 
 impl Display for Stream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!()
+        match &self.name {
+            Some(name) => write!(f, "Stream '{0} with '{1}' and data type '{2}'", name, self.shape, self.dtype),
+            None => write!(f, "Unnamed Stream with '{0}' and data type '{1}'", self.shape, self.dtype)
+        }
     }
 }
 
@@ -138,13 +162,13 @@ struct RawStreamsMD {
 pub struct StreamReader
 {
     input: Box<dyn Iterator<Item= io::Result<String>>>,
-    high_water_mark: u32,
+    high_water_mark: usize,
     metadata: Vec<Stream>,
-    buffers: Vec<Box<[ArrayD<f32>]>>,
+    buffers: Vec<ArrayD<f32>>,
 }
 
 impl StreamReader {
-    pub fn new(fname: &Path, high_water_mark: u32) -> Result<StreamReader, io::Error> {
+    pub fn new(fname: &Path, buf_size: usize) -> Result<StreamReader, io::Error> {
         let lines = build_line_iterator(fname)?;
         let mut filtered_lines = filter_out_comment_lines('#', lines);
         let metadata_str = read_until_line_starts_with("Data:", 92, &mut filtered_lines)?;
@@ -153,12 +177,18 @@ impl StreamReader {
             Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
         };
         let metadata: Vec<Stream> = raw_metadata.Metadata.iter().map(Stream::try_from).try_collect()?;
-        let stream_buffers: Vec<Box<[ArrayD<f32>]> = metadata.iter().map(|m| Box::new([ArrayD; m.shape.iter().product()])); 
+        let stream_buffers: Vec<ArrayD<f32>> = metadata.iter().map(|md| {
+            let elem_dim = match &md.shape {
+                StreamDimensions::Static(elem_dim) => &elem_dim[..],
+                StreamDimensions::Dynamic{ element_size, entries_per_row: _ } => &element_size[..],
+            };
+            ArrayD::<f32>::zeros([&[buf_size], &elem_dim[..]].concat())
+        }).collect(); 
         Ok(StreamReader {
             input: Box::new(filtered_lines),
-            high_water_mark,
+            high_water_mark: buf_size * 0.9 as usize,
             metadata,
-            buffers: Box::new([Box::new([Box::new([metadata.shape.iter().product()]); high_water_mark]); metadata.len()])
+            buffers: stream_buffers
         })
     }
 }
@@ -190,6 +220,7 @@ pub fn read_until_line_starts_with<'a>(matchstr: &'a str, max_lines: i32, lines:
         if counter > max_lines {
             break;
         }
+        counter += 1;
         match line {
             Ok(l) => if l.starts_with(matchstr) { 
                 break 
@@ -221,7 +252,7 @@ pub fn build_array<'a>(shape: &Vec<usize>, data: &'a Vec<&'a str>) -> Result<Arr
 /// This function alters the iterator that represents the current location in the file, leaving it
 /// at line n+1. The first n lines are concatinated into a string that is returned at the end of
 /// the function
-fn read_n_lines<'a>(n: u32, lines: &'a mut impl Iterator<Item = io::Result<String>>) -> io::Result<String> {
+pub fn read_n_lines<'a>(n: u32, lines: &'a mut impl Iterator<Item = io::Result<String>>) -> io::Result<String> {
     let mut res = String::new();
     for _i in 0..n {
         let line = lines.next();
@@ -283,8 +314,8 @@ shape: [3, 3]
     #[test]
     fn test_comment_filter() {
         let file = File::open("./tests/test_metadata_with_comments.yaml").unwrap();
-        let file = BufReader::new(file);
-        let lines_with_comments_filtered_out: String = read_lines_without_comments(file).unwrap().map(|line| line + "\n").collect();
+        let file = BufReader::new(file).lines();
+        let lines_with_comments_filtered_out: String = filter_out_comment_lines('#', file).map(|line| line.map(|l| l + "\n")).try_collect().unwrap();
         let expected = read_to_string("./tests/test_metadata.yaml").unwrap();
         assert_eq!(lines_with_comments_filtered_out, expected);
     }
@@ -303,7 +334,7 @@ shape: [3, 3]
     #[test]
     fn test_stream_dimension_parsing() {
         assert_eq!(StreamDimensions::Static(vec![1,1,2]), vec![1,1,2].try_into().unwrap());
-        assert_eq!(StreamDimensions::Dynamic(vec![1,1,2]), vec![1,1,2, -1].try_into().unwrap());
+        assert_eq!(StreamDimensions::Dynamic { element_size: vec![1,1,2], entries_per_row: vec![] }, vec![1,1,2, -1].try_into().unwrap());
     }
 
     #[test]
@@ -312,12 +343,6 @@ shape: [3, 3]
         let _stream_dim: StreamDimensions = vec![1,-1,4].try_into().unwrap();
     }
 
-    #[test]
-    fn test_read_until_data_section() {
-        let mut test_input_line_iter = BufReader::new(File::open("../tests/test_read_until_data_section")).lines();
-        let metadata_str = read_until_data_section(&mut test_input_line_iter, 100).unwrap();
-        assert_eq!(test_input_line_iter.next().unwrap(), "-1");
-    }
     #[test]
     fn test_read_n_lines() {
         let mut file = BufReader::new(File::open("tests/read_n_lines_test").unwrap()).lines(); 
@@ -354,7 +379,7 @@ shape: [3, 3]
     #[test]
     fn test_read_until_data_start() {
         let mut file = BufReader::new(File::open("tests/read_metadata_section").unwrap()).lines();
-        let metadata_section = read_until_line_starts_with("Data:", &mut file).unwrap();
+        let metadata_section = read_until_line_starts_with("Data:", 100, &mut file).unwrap();
         assert_eq!(metadata_section, "Metadata:\n  - name: Stream1\n    dtype: int\n    shape: [1]\n");
         let next_line = file.next().unwrap().unwrap();
         assert_eq!(next_line, "1");
